@@ -5,6 +5,11 @@ pragma solidity ^0.8.20;
  * @title PredictionMarket
  * @dev AMM-based prediction market contract. Each market has YES/NO outcome tokens.
  *      Uses a constant-product AMM (x*y=k) for price discovery.
+ *
+ *      Price formula: P(YES) = noReserve / (yesReserve + noReserve)
+ *      - When YES is bought, yesReserve decreases (YES more scarce) → P(YES) goes UP
+ *      - When NO is bought, noReserve decreases (NO more scarce) → P(NO) goes UP
+ *
  *      Settlement via Binance oracle (for crypto markets) or admin/UMA (for community markets).
  */
 contract PredictionMarket {
@@ -96,6 +101,11 @@ contract PredictionMarket {
         });
     }
 
+    /**
+     * @dev Seed the pool with equal YES and NO shares.
+     *      USDC is held as collateral backing both sides.
+     *      Initial price: 50/50 (yesReserve == noReserve).
+     */
     function addInitialLiquidity(uint256 _usdcAmount) external {
         require(market.status == MarketStatus.ACTIVE, "Market not active");
         require(totalLpShares == 0, "Initial liquidity already provided");
@@ -118,79 +128,111 @@ contract PredictionMarket {
         emit LiquidityAdded(msg.sender, _usdcAmount, totalLpShares);
     }
 
+    /**
+     * @dev Buy YES or NO shares from the AMM pool.
+     *      Uses constant product formula: k = yesReserve * noReserve
+     *
+     *      Buying YES: USDC goes to NO side, YES shares come out → YES price up
+     *      sharesOut = yesReserve - k / (noReserve + usdcIn)
+     *
+     *      Buying NO: USDC goes to YES side, NO shares come out → NO price up
+     *      sharesOut = noReserve - k / (yesReserve + usdcIn)
+     */
     function buyShares(Outcome _outcome, uint256 _usdcIn, uint256 _minShares) external activeMarket {
         usdc.transferFrom(msg.sender, address(this), _usdcIn);
 
+        uint256 usdcScaled = _usdcIn * PRECISION;
         uint256 sharesOut;
+
         if (_outcome == Outcome.YES) {
-            uint256 newYesReserve = yesReserve + (_usdcIn * PRECISION);
-            sharesOut = (totalYesSupply * (newYesReserve - yesReserve)) / newYesReserve;
+            uint256 newNoReserve = noReserve + usdcScaled;
+            sharesOut = yesReserve - (k / newNoReserve);
 
             require(sharesOut >= _minShares, "Slippage exceeded");
-            require(sharesOut < yesReserve, "Exceeds pool capacity");
+            require(yesBalances[address(this)] >= sharesOut, "Insufficient YES in pool");
 
-            yesReserve = newYesReserve - sharesOut;
+            yesReserve -= sharesOut;
+            noReserve = newNoReserve;
             yesBalances[address(this)] -= sharesOut;
             yesBalances[msg.sender] += sharesOut;
-            noReserve += (_usdcIn * PRECISION);
-            totalYesSupply += sharesOut;
         } else {
-            uint256 newNoReserve = noReserve + (_usdcIn * PRECISION);
-            sharesOut = (totalNoSupply * (newNoReserve - noReserve)) / newNoReserve;
+            uint256 newYesReserve = yesReserve + usdcScaled;
+            sharesOut = noReserve - (k / newYesReserve);
 
             require(sharesOut >= _minShares, "Slippage exceeded");
-            require(sharesOut < noReserve, "Exceeds pool capacity");
+            require(noBalances[address(this)] >= sharesOut, "Insufficient NO in pool");
 
-            noReserve = newNoReserve - sharesOut;
+            noReserve -= sharesOut;
+            yesReserve = newYesReserve;
             noBalances[address(this)] -= sharesOut;
             noBalances[msg.sender] += sharesOut;
-            yesReserve += (_usdcIn * PRECISION);
-            totalNoSupply += sharesOut;
         }
 
-        k = yesReserve * noReserve;
         emit SharesPurchased(msg.sender, _outcome, _usdcIn, sharesOut);
     }
 
+    /**
+     * @dev Sell YES or NO shares back to the AMM pool.
+     *      Reverse of buy: shares go back to pool, USDC comes out.
+     */
     function sellShares(Outcome _outcome, uint256 _sharesIn, uint256 _minUsdc) external activeMarket {
         uint256 usdcOut;
 
         if (_outcome == Outcome.YES) {
             require(yesBalances[msg.sender] >= _sharesIn, "Insufficient YES shares");
-            usdcOut = (_sharesIn * (yesReserve - totalYesSupply + yesBalances[address(this)])) / PRECISION;
+
+            uint256 newYesReserve = yesReserve + _sharesIn;
+            uint256 usdcScaled = noReserve - (k / newYesReserve);
+            usdcOut = usdcScaled / PRECISION;
+
             require(usdcOut >= _minUsdc, "Slippage exceeded");
 
             yesBalances[msg.sender] -= _sharesIn;
             yesBalances[address(this)] += _sharesIn;
-            yesReserve -= usdcOut;
-            noReserve += usdcOut * PRECISION;
+            yesReserve = newYesReserve;
+            noReserve -= usdcScaled;
         } else {
             require(noBalances[msg.sender] >= _sharesIn, "Insufficient NO shares");
-            usdcOut = (_sharesIn * (noReserve - totalNoSupply + noBalances[address(this)])) / PRECISION;
+
+            uint256 newNoReserve = noReserve + _sharesIn;
+            uint256 usdcScaled = yesReserve - (k / newNoReserve);
+            usdcOut = usdcScaled / PRECISION;
+
             require(usdcOut >= _minUsdc, "Slippage exceeded");
 
             noBalances[msg.sender] -= _sharesIn;
             noBalances[address(this)] += _sharesIn;
-            noReserve -= usdcOut;
-            yesReserve += usdcOut * PRECISION;
+            noReserve = newNoReserve;
+            yesReserve -= usdcScaled;
         }
 
         uint256 fee = (usdcOut * market.feeBps) / FEE_DENOMINATOR;
         uint256 userAmount = usdcOut - fee;
         usdc.transfer(msg.sender, userAmount);
 
-        k = yesReserve * noReserve;
         emit SharesSold(msg.sender, _outcome, _sharesIn, userAmount);
     }
 
+    /**
+     * @dev YES implied probability (0 = 0%, 1e18 = 100%).
+     *      P(YES) = noReserve / (yesReserve + noReserve)
+     *      Fewer YES in pool (more bought) → higher P(YES).
+     */
     function getYesPrice() external view returns (uint256) {
-        return (yesReserve * PRECISION) / (yesReserve + noReserve);
-    }
-
-    function getNoPrice() external view returns (uint256) {
         return (noReserve * PRECISION) / (yesReserve + noReserve);
     }
 
+    /**
+     * @dev NO implied probability. P(NO) = 1 - P(YES).
+     *      P(NO) = yesReserve / (yesReserve + noReserve)
+     */
+    function getNoPrice() external view returns (uint256) {
+        return (yesReserve * PRECISION) / (yesReserve + noReserve);
+    }
+
+    /**
+     * @dev Resolve the market. Only callable by the oracle after resolveTime.
+     */
     function resolveMarket(Outcome _winningOutcome) external onlyOracle {
         require(block.timestamp >= market.resolveTime, "Cannot resolve yet");
         require(market.status == MarketStatus.ACTIVE, "Market not active");
@@ -201,6 +243,9 @@ contract PredictionMarket {
         emit MarketResolved(_winningOutcome, this.getYesPrice(), this.getNoPrice());
     }
 
+    /**
+     * @dev Claim winnings after market resolution.
+     */
     function claimWinnings() external {
         require(market.status == MarketStatus.RESOLVED, "Market not resolved");
 
