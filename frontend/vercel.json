@@ -1,0 +1,10 @@
+{
+  "build": {
+    "env": {
+      "NEXT_PUBLIC_API_URL": "@oddify_api_url"
+    }
+  },
+  "github": {
+    "silent": true
+  }
+}

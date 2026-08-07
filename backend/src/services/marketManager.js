@@ -1,73 +1,90 @@
+import { ethers } from 'ethers';
+import { ContractService } from '../services/contractService.js';
+
 /**
  * MarketManager — handles market lifecycle, creation, and settlement.
- * Interfaces with the MarketFactory smart contract on Polygon and the Binance oracle.
+ * Works with both in-memory cache (dev) and on-chain contracts (production).
  */
 export class MarketManager {
-  constructor(oracle) {
+  constructor(oracle, contracts = null) {
     this.oracle = oracle;
-    this.markets = new Map(); // in-memory cache (backed by DB in production)
+    this.contracts = contracts || new ContractService();
+    this.markets = new Map();
     this.marketId = 1;
 
-    // Register oracle listener for auto-settlement of crypto markets
+    // Register oracle listener for auto-settlement
     this.oracle.onPriceUpdate((ticker) => {
       this.checkCryptoMarketSettlements(ticker);
     });
   }
 
   /**
-   * Create a new prediction market
+   * Create a new prediction market (on-chain + in-memory cache)
    */
-  createMarket({ question, symbol, strikePrice, direction, expiryMinutes, isCryptoMarket, creator }) {
+  async createMarket({ question, symbol, strikePrice, direction, expiryMinutes, isCryptoMarket, creator }) {
     const id = this.marketId++;
     const now = Date.now();
     const expiryTime = now + (expiryMinutes * 60 * 1000);
-    const resolveTime = expiryTime + (60 * 1000); // 1 min buffer
+    const resolveTime = expiryTime + (60 * 1000);
+
+    const oracleId = `${symbol}-${strikePrice}-${direction}-${Math.floor(expiryTime / 1000)}`;
 
     const market = {
       id: String(id),
       question,
       symbol: symbol?.toUpperCase(),
       strikePrice,
-      direction, // 'UP' or 'DOWN' for crypto, null for community
+      direction,
       isCryptoMarket,
       creator,
       status: 'ACTIVE',
       createdAt: now,
       expiryTime,
       resolveTime,
-      // AMM state
+      oracleId,
+      // AMM state (in-memory mirror)
       yesReserve: 1000,
       noReserve: 1000,
       k: 1000000,
-      // Price history for charting
+      // On-chain address (set after contract creation)
+      contractAddress: null,
+      // Price history
       priceHistory: [{ time: now, yesPrice: 0.5, noPrice: 0.5 }]
     };
+
+    // Try to create on-chain if contract service is configured
+    if (this.contracts?.factory && this.contracts?.signer) {
+      try {
+        const onChainResult = await this.contracts.createMarketOnChain({
+          question,
+          oracleId,
+          expiryTime: Math.floor(expiryTime / 1000),
+          resolveTime: Math.floor(resolveTime / 1000),
+          isCryptoMarket
+        });
+        market.contractAddress = onChainResult.marketAddress || null;
+        console.log(`📋 Market created on-chain: ${market.contractAddress}`);
+      } catch (e) {
+        console.error('On-chain market creation failed:', e.message);
+        // Continue with off-chain fallback
+      }
+    }
 
     this.markets.set(String(id), market);
     return market;
   }
 
-  /**
-   * Get all active markets
-   */
   getActiveMarkets() {
     return Array.from(this.markets.values()).filter(m => m.status === 'ACTIVE');
   }
 
-  /**
-   * Get a specific market
-   */
   getMarket(id) {
     return this.markets.get(String(id));
   }
 
-  /**
-   * Get current YES/NO prices from AMM
-   */
   getPrices(marketId) {
     const m = this.markets.get(String(marketId));
     if (!m) return null;
-
     const total = m.yesReserve + m.noReserve;
     return {
       yes: m.yesReserve / total,
@@ -77,9 +94,6 @@ export class MarketManager {
     };
   }
 
-  /**
-   * Buy shares from the AMM pool
-   */
   buyShares(marketId, outcome, usdcAmount) {
     const m = this.markets.get(String(marketId));
     if (!m) throw new Error('Market not found');
@@ -100,7 +114,6 @@ export class MarketManager {
     }
     m.k = m.yesReserve * m.noReserve;
 
-    // Update price history
     const total = m.yesReserve + m.noReserve;
     m.priceHistory.push({
       time: Date.now(),
@@ -112,14 +125,14 @@ export class MarketManager {
   }
 
   /**
-   * Check if any crypto markets need settlement
+   * Check expired crypto markets and settle them via Binance oracle.
+   * If contract service is configured, also settles on-chain.
    */
-  checkCryptoMarketSettlements(ticker) {
+  async checkCryptoMarketSettlements(ticker) {
     for (const [id, m] of this.markets) {
       if (m.status !== 'ACTIVE' || !m.isCryptoMarket) continue;
       if (Date.now() < m.expiryTime) continue;
 
-      // Market has expired — settle using Binance price
       const currentPrice = this.oracle.getPrice(m.symbol);
       if (!currentPrice) continue;
 
@@ -136,12 +149,19 @@ export class MarketManager {
       m.resolvedAt = Date.now();
 
       console.log(`📊 Market ${id} resolved: ${winningOutcome} (price: $${currentPrice} vs strike: $${m.strikePrice})`);
+
+      // Settle on-chain if contract exists
+      if (m.contractAddress && this.contracts?.signer) {
+        try {
+          await this.contracts.resolveMarket(m.contractAddress, winningOutcome);
+          console.log(`✅ Market ${id} settled on-chain`);
+        } catch (e) {
+          console.error(`❌ On-chain settlement failed for market ${id}:`, e.message);
+        }
+      }
     }
   }
 
-  /**
-   * Resolve a community (non-crypto) market — admin only
-   */
   resolveCommunityMarket(marketId, winningOutcome) {
     const m = this.markets.get(String(marketId));
     if (!m) throw new Error('Market not found');
@@ -155,9 +175,6 @@ export class MarketManager {
     return m;
   }
 
-  /**
-   * Get markets by type
-   */
   getMarketsByType(isCrypto) {
     return Array.from(this.markets.values()).filter(m => m.isCryptoMarket === isCrypto && m.status === 'ACTIVE');
   }

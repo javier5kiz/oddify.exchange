@@ -9,6 +9,7 @@ import { userRoutes } from './routes/users.js';
 import { apiDocsRoute } from './routes/docs.js';
 import { BinanceOracle } from './services/binanceOracle.js';
 import { MarketManager } from './services/marketManager.js';
+import { ContractService } from './services/contractService.js';
 import { errorHandler, notFound } from './middleware/errorHandler.js';
 
 const app = express();
@@ -19,23 +20,36 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Services
+// Initialize services
 const oracle = new BinanceOracle();
-const marketManager = new MarketManager(oracle);
+const contracts = new ContractService();
+const marketManager = new MarketManager(oracle, contracts);
 
-// Initialize oracle WebSocket connection
+// Wire contract service for on-chain settlement
+if (process.env.FACTORY_ADDRESS) {
+  console.log('📋 Factory contract:', process.env.FACTORY_ADDRESS);
+  console.log('📋 USDC contract:', process.env.USDC_ADDRESS || 'not set');
+}
+
+// Connect Binance oracle WebSocket
 oracle.connect();
 
 // Routes
 app.use('/api/v1/markets', marketRoutes(marketManager));
 app.use('/api/v1/orders', orderRoutes(marketManager));
 app.use('/api/v1/prices', priceRoutes(oracle));
-app.use('/api/v1/users', userRoutes());
-app.use('/api/v1/docs', apiDocsRoute);
+app.use('/api/v1/users', userRoutes(contracts));
+app.use('/api/v1/docs', apiDocsRoute());
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    binanceConnected: oracle.ws?.readyState === 1,
+    factory: process.env.FACTORY_ADDRESS || 'not configured',
+    network: process.env.POLYGON_RPC?.includes('amoy') ? 'amoy-testnet' : 'mainnet'
+  });
 });
 
 // 404 and error handling
@@ -55,7 +69,6 @@ const wss = new WebSocketServer({ server, path: '/api/v1/stream' });
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
 
-  // Send price updates every 2 seconds
   const priceInterval = setInterval(() => {
     const prices = oracle.getAllPrices();
     ws.send(JSON.stringify({ type: 'prices', data: prices }));
@@ -73,3 +86,5 @@ wss.on('connection', (ws) => {
     console.log('WebSocket client disconnected');
   });
 });
+
+export { app, server };
