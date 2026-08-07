@@ -1,3 +1,5 @@
+import express from 'express';
+
 export function marketRoutes(marketManager) {
   const router = express.Router();
 
@@ -42,24 +44,28 @@ export function marketRoutes(marketManager) {
   });
 
   // POST /api/v1/markets — create a new market
-  router.post('/', (req, res) => {
+  router.post('/', async (req, res) => {
     const { question, symbol, strikePrice, direction, expiryMinutes, isCryptoMarket, creator } = req.body;
 
     if (!question || !expiryMinutes) {
       return res.status(400).json({ error: 'Missing required fields: question, expiryMinutes' });
     }
 
-    const market = marketManager.createMarket({
-      question,
-      symbol,
-      strikePrice,
-      direction,
-      expiryMinutes,
-      isCryptoMarket: isCryptoMarket ?? true,
-      creator: creator || '0x0000000000000000000000000000000000000000'
-    });
+    try {
+      const market = await marketManager.createMarket({
+        question,
+        symbol,
+        strikePrice,
+        direction,
+        expiryMinutes,
+        isCryptoMarket: isCryptoMarket ?? true,
+        creator: creator || '0x0000000000000000000000000000000000000000'
+      });
 
-    res.status(201).json({ data: market });
+      res.status(201).json({ data: market });
+    } catch (e) {
+      res.status(400).json({ error: e.message });
+    }
   });
 
   // GET /api/v1/markets/:id/prices — get current AMM prices
@@ -96,5 +102,3 @@ export function marketRoutes(marketManager) {
 
   return router;
 }
-
-import express from 'express';

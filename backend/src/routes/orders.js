@@ -1,3 +1,5 @@
+import express from 'express';
+
 export function orderRoutes(marketManager) {
   const router = express.Router();
 
@@ -14,12 +16,10 @@ export function orderRoutes(marketManager) {
     }
 
     try {
-      // Execute via in-memory AMM (instant)
-      const result = marketManager.buyShares(marketId, outcome, usdcAmount);
+      const result = marketManager.buyShares(marketId, outcome, Number(usdcAmount));
 
-      // If contract address exists, also prepare on-chain tx data
-      let onChainData = null;
       const market = marketManager.getMarket(marketId);
+      let onChainData = null;
       if (market?.contractAddress) {
         onChainData = {
           contractAddress: market.contractAddress,
@@ -103,5 +103,3 @@ export function orderRoutes(marketManager) {
 
   return router;
 }
-
-import express from 'express';

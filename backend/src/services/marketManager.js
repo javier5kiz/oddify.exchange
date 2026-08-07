@@ -4,6 +4,18 @@ import { ContractService } from '../services/contractService.js';
 /**
  * MarketManager — handles market lifecycle, creation, and settlement.
  * Works with both in-memory cache (dev) and on-chain contracts (production).
+ *
+ * AMM price formula (matches smart contract):
+ *   P(YES) = noReserve / (yesReserve + noReserve)
+ *   P(NO)  = yesReserve / (yesReserve + noReserve)
+ *
+ * Buy YES: USDC → NO side, YES shares come out → YES price UP
+ *   newNoReserve = noReserve + usdcAmount
+ *   sharesOut = yesReserve - k / newNoReserve
+ *
+ * Buy NO: USDC → YES side, NO shares come out → NO price UP
+ *   newYesReserve = yesReserve + usdcAmount
+ *   sharesOut = noReserve - k / newYesReserve
  */
 export class MarketManager {
   constructor(oracle, contracts = null) {
@@ -12,10 +24,68 @@ export class MarketManager {
     this.markets = new Map();
     this.marketId = 1;
 
+    // Seed a demo market so the frontend isn't empty on first deploy
+    this._seedDemoMarkets();
+
     // Register oracle listener for auto-settlement
     this.oracle.onPriceUpdate((ticker) => {
       this.checkCryptoMarketSettlements(ticker);
     });
+  }
+
+  _seedDemoMarkets() {
+    const now = Date.now();
+    const markets = [
+      {
+        question: 'Will BTC be above $65,000 in 1 hour?',
+        symbol: 'BTCUSDT',
+        strikePrice: 65000,
+        direction: 'UP',
+        expiryMinutes: 60,
+        isCryptoMarket: true,
+      },
+      {
+        question: 'Will ETH be above $3,500 in 30 minutes?',
+        symbol: 'ETHUSDT',
+        strikePrice: 3500,
+        direction: 'UP',
+        expiryMinutes: 30,
+        isCryptoMarket: true,
+      },
+      {
+        question: 'Will SOL be above $150 in 2 hours?',
+        symbol: 'SOLUSDT',
+        strikePrice: 150,
+        direction: 'UP',
+        expiryMinutes: 120,
+        isCryptoMarket: true,
+      },
+    ];
+
+    for (const m of markets) {
+      const id = this.marketId++;
+      const expiryTime = now + (m.expiryMinutes * 60 * 1000);
+      this.markets.set(String(id), {
+        id: String(id),
+        question: m.question,
+        symbol: m.symbol,
+        strikePrice: m.strikePrice,
+        direction: m.direction,
+        isCryptoMarket: m.isCryptoMarket,
+        creator: '0x0000000000000000000000000000000000000000',
+        status: 'ACTIVE',
+        createdAt: now,
+        expiryTime,
+        resolveTime: expiryTime + 60000,
+        oracleId: `${m.symbol}-${m.strikePrice}-${m.direction}`,
+        // AMM state — 1000 USDC initial liquidity on each side
+        yesReserve: 1000,
+        noReserve: 1000,
+        k: 1000000,
+        contractAddress: null,
+        priceHistory: [{ time: now, yesPrice: 0.5, noPrice: 0.5 }],
+      });
+    }
   }
 
   /**
@@ -42,13 +112,10 @@ export class MarketManager {
       expiryTime,
       resolveTime,
       oracleId,
-      // AMM state (in-memory mirror)
       yesReserve: 1000,
       noReserve: 1000,
       k: 1000000,
-      // On-chain address (set after contract creation)
       contractAddress: null,
-      // Price history
       priceHistory: [{ time: now, yesPrice: 0.5, noPrice: 0.5 }]
     };
 
@@ -66,7 +133,6 @@ export class MarketManager {
         console.log(`📋 Market created on-chain: ${market.contractAddress}`);
       } catch (e) {
         console.error('On-chain market creation failed:', e.message);
-        // Continue with off-chain fallback
       }
     }
 
@@ -82,18 +148,29 @@ export class MarketManager {
     return this.markets.get(String(id));
   }
 
+  /**
+   * AMM price — matches smart contract formula.
+   * P(YES) = noReserve / (yesReserve + noReserve)
+   * Buying YES reduces yesReserve → P(YES) goes UP.
+   */
   getPrices(marketId) {
     const m = this.markets.get(String(marketId));
     if (!m) return null;
     const total = m.yesReserve + m.noReserve;
+    if (total === 0) return { yes: 0.5, no: 0.5, yesPrice: 0.5, noPrice: 0.5 };
     return {
-      yes: m.yesReserve / total,
-      no: m.noReserve / total,
-      yesPrice: m.yesReserve / total,
-      noPrice: m.noReserve / total
+      yes: m.noReserve / total,
+      no: m.yesReserve / total,
+      yesPrice: m.noReserve / total,
+      noPrice: m.yesReserve / total
     };
   }
 
+  /**
+   * Buy shares from the AMM using constant product formula (k = yesReserve * noReserve).
+   * Buying YES: USDC goes to NO side, YES shares come out.
+   * Buying NO: USDC goes to YES side, NO shares come out.
+   */
   buyShares(marketId, outcome, usdcAmount) {
     const m = this.markets.get(String(marketId));
     if (!m) throw new Error('Market not found');
@@ -101,32 +178,42 @@ export class MarketManager {
     if (Date.now() > m.expiryTime) throw new Error('Market expired');
 
     let sharesOut;
+
     if (outcome === 'YES') {
-      const newYesReserve = m.yesReserve + usdcAmount;
-      sharesOut = (1000 * (newYesReserve - m.yesReserve)) / newYesReserve;
-      m.yesReserve = newYesReserve - sharesOut;
-      m.noReserve += usdcAmount;
-    } else {
+      // USDC added to NO side, YES shares come out
       const newNoReserve = m.noReserve + usdcAmount;
-      sharesOut = (1000 * (newNoReserve - m.noReserve)) / newNoReserve;
-      m.noReserve = newNoReserve - sharesOut;
-      m.yesReserve += usdcAmount;
+      const newYesReserve = m.k / newNoReserve;
+      sharesOut = m.yesReserve - newYesReserve;
+      m.yesReserve = newYesReserve;
+      m.noReserve = newNoReserve;
+    } else {
+      // USDC added to YES side, NO shares come out
+      const newYesReserve = m.yesReserve + usdcAmount;
+      const newNoReserve = m.k / newYesReserve;
+      sharesOut = m.noReserve - newNoReserve;
+      m.yesReserve = newYesReserve;
+      m.noReserve = newNoReserve;
     }
+
     m.k = m.yesReserve * m.noReserve;
 
     const total = m.yesReserve + m.noReserve;
     m.priceHistory.push({
       time: Date.now(),
-      yesPrice: m.yesReserve / total,
-      noPrice: m.noReserve / total
+      yesPrice: m.noReserve / total,
+      noPrice: m.yesReserve / total
     });
+
+    // Keep only last 100 price points
+    if (m.priceHistory.length > 100) {
+      m.priceHistory = m.priceHistory.slice(-100);
+    }
 
     return { sharesOut, market: m };
   }
 
   /**
    * Check expired crypto markets and settle them via Binance oracle.
-   * If contract service is configured, also settles on-chain.
    */
   async checkCryptoMarketSettlements(ticker) {
     for (const [id, m] of this.markets) {
@@ -150,7 +237,6 @@ export class MarketManager {
 
       console.log(`📊 Market ${id} resolved: ${winningOutcome} (price: $${currentPrice} vs strike: $${m.strikePrice})`);
 
-      // Settle on-chain if contract exists
       if (m.contractAddress && this.contracts?.signer) {
         try {
           await this.contracts.resolveMarket(m.contractAddress, winningOutcome);
