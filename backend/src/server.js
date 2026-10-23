@@ -56,11 +56,15 @@ app.get('/health', (req, res) => {
 app.use(notFound);
 app.use(errorHandler);
 
-server.listen(PORT, () => {
-  console.log(`Oddify Exchange API running on port ${PORT}`);
-  console.log(`API Docs: http://localhost:${PORT}/api/v1/docs`);
-  console.log(`WebSocket: ws://localhost:${PORT}/api/v1/stream`);
-});
+if (process.env.VERCEL) {
+  console.log('Running as Vercel serverless function (REST only)');
+} else {
+  server.listen(PORT, () => {
+    console.log(`Oddify Exchange API running on port ${PORT}`);
+    console.log(`API Docs: http://localhost:${PORT}/api/v1/docs`);
+    console.log(`WebSocket: ws://localhost:${PORT}/api/v1/stream`);
+  });
+}
 
 // WebSocket for real-time price + orderbook updates
 import { WebSocketServer } from 'ws';
